@@ -1,14 +1,13 @@
 import discord
 from discord.ext import commands
-from keep_alive import keep_alive   # Webserver für Replit-24/7
 import json
 import os
 
 # ---------------------------------------------------------
-#                 TOKEN HIER EINTRAGEN
+#                 TOKEN AUS UMGEBUNG LADEN
 # ---------------------------------------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # wird später auf dem VPS gesetzt
 
 CONFIG_FILE = "config.json"
 
@@ -532,15 +531,15 @@ async def on_message(message: discord.Message):
 
 
 # ---------------------------------------------------------
-#                 BOT + KEEP-ALIVE STARTEN
+#                 BOT STARTEN
 # ---------------------------------------------------------
 
-print("Starte Bot.run...")
-
-# Webserver für UptimeRobot / Replit-Alive
-keep_alive()
-
-try:
-    bot.run(BOT_TOKEN)
-except Exception as e:
-    print("Fehler beim Starten des Bots:", repr(e))
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        print("Fehler: BOT_TOKEN ist nicht gesetzt! Bitte als Umgebungsvariable setzen.")
+    else:
+        print("Starte Bot.run...")
+        try:
+            bot.run(BOT_TOKEN)
+        except Exception as e:
+            print("Fehler beim Starten des Bots:", repr(e))
