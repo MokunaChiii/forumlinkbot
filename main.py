@@ -8,27 +8,66 @@ from typing import Dict, Any, List
 #                KONFIG & GRUNDSETUP
 # =====================================================
 
-# Entweder direkt eintragen oder per Environment-Variable
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
 CONFIG_FILE = "config.json"
 
 
 def load_config() -> Dict[str, Any]:
-    """Lädt die Konfiguration aus config.json oder liefert eine leere Grundstruktur."""
+    """Lädt die Konfiguration aus config.json oder liefert eine Grundstruktur."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                # kleine Migration: sicherstellen, dass "guilds" existiert
-                if "guilds" not in data:
-                    data["guilds"] = {}
-                return data
+            if not isinstance(data, dict):
+                data = {}
         except Exception as e:
             print("Fehler beim Laden der config.json:", repr(e))
+            data = {}
+    else:
+        data = {}
 
-    return {"guilds": {}}
+    # Grundstruktur
+    data.setdefault("guilds", {})
+
+    # Migration älterer Strukturen
+    for gid, gcfg in data["guilds"].items():
+        # forum_pairs als Liste sicherstellen
+        gcfg.setdefault("forum_pairs", [])
+        gcfg.setdefault("follow_roles", [])
+        gcfg.setdefault("follow_threads", [])
+
+        # alte Paare mit nur "target_id" auf neue Struktur heben
+        new_pairs = []
+        for pair in gcfg["forum_pairs"]:
+            if not isinstance(pair, dict):
+                continue
+            forum_id = pair.get("forum_id")
+            new_target = pair.get("new_target_id")
+            follow_target = pair.get("follow_target_id")
+            old_target = pair.get("target_id")
+
+            if forum_id is None:
+                continue
+
+            if new_target is None and follow_target is None and old_target is not None:
+                new_target = old_target
+                follow_target = old_target
+
+            if new_target is None:
+                new_target = follow_target
+            if follow_target is None:
+                follow_target = new_target
+
+            new_pairs.append(
+                {
+                    "forum_id": forum_id,
+                    "new_target_id": new_target,
+                    "follow_target_id": follow_target,
+                }
+            )
+        gcfg["forum_pairs"] = new_pairs
+
+    return data
 
 
 def save_config() -> None:
@@ -48,14 +87,15 @@ def get_guild_cfg(guild_id: int) -> Dict[str, Any]:
     """Gibt die Konfiguration für eine Guild zurück (oder legt sie an)."""
     gid = str(guild_id)
     if gid not in config["guilds"]:
-        config["guilds"][gid] = {}
+        config["guilds"][gid] = {
+            "forum_pairs": [],
+            "follow_roles": [],
+            "follow_threads": [],
+        }
     g = config["guilds"][gid]
-
-    # Standard-Strukturen sicherstellen
-    g.setdefault("forum_pairs", [])      # Liste aus {forum_id, target_id}
-    g.setdefault("follow_roles", [])     # Liste von Rollen-IDs
-    g.setdefault("follow_threads", [])   # Liste von Thread-IDs, die manuell gefollowed werden
-
+    g.setdefault("forum_pairs", [])
+    g.setdefault("follow_roles", [])
+    g.setdefault("follow_threads", [])
     return g
 
 
@@ -66,7 +106,7 @@ def get_guild_cfg(guild_id: int) -> Dict[str, Any]:
 intents = discord.Intents.default()
 intents.guilds = True
 intents.message_content = True
-intents.messages = True  # wichtig für on_message
+intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -83,8 +123,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    """Hier laufen sowohl Commands als auch Follow-Logik."""
-    # Erst Commands verarbeiten, sonst reagieren !-Befehle nicht
+    """Verarbeitet Commands & Follow-Benachrichtigungen."""
     await bot.process_commands(message)
 
     # DMs / Bots ignorieren
@@ -94,7 +133,7 @@ async def on_message(message: discord.Message):
     guild = message.guild
     gcfg = get_guild_cfg(guild.id)
 
-    # Nur auf Nachrichten in Threads reagieren
+    # Nur in Threads
     if not isinstance(message.channel, discord.Thread):
         return
 
@@ -104,31 +143,30 @@ async def on_message(message: discord.Message):
     if thread.id not in gcfg["follow_threads"]:
         return
 
-    # Wenn derjenige, der antwortet, eine Follow-Rolle hat => KEINE Benachrichtigung
+    # Wenn Autor eine Follow-Rolle hat -> keine Benachrichtigung
     follow_roles_ids: List[int] = gcfg.get("follow_roles", [])
     if follow_roles_ids:
-        for r in message.author.roles:
+        for r in getattr(message.author, "roles", []):
             if r.id in follow_roles_ids:
-                # Antwort von Mod/Admin -> keine Ping-Nachricht
                 return
 
-    # Wir brauchen den passenden Target-Channel für dieses Forum
     parent_id = thread.parent_id
     if parent_id is None:
         return
 
-    # Alle Paare durchsuchen, die dieses Forum nutzen
-    target_channels = []
+    # Passende Follow-Target-Channels für dieses Forum
+    follow_targets: List[discord.TextChannel] = []
     for pair in gcfg.get("forum_pairs", []):
         if pair.get("forum_id") == parent_id:
-            target = guild.get_channel(pair.get("target_id", 0))
-            if isinstance(target, discord.TextChannel):
-                target_channels.append(target)
+            t_id = pair.get("follow_target_id") or pair.get("new_target_id")
+            ch = guild.get_channel(t_id)
+            if isinstance(ch, discord.TextChannel):
+                follow_targets.append(ch)
 
-    if not target_channels:
+    if not follow_targets:
         return
 
-    # Rollen, die gepingt werden sollen
+    # Ping-Rollen
     roles_to_ping = [
         guild.get_role(rid) for rid in follow_roles_ids
         if guild.get_role(rid) is not None
@@ -149,7 +187,7 @@ async def on_message(message: discord.Message):
         color=0x00BFFF
     )
 
-    for target in target_channels:
+    for target in follow_targets:
         try:
             if mention_text:
                 await target.send(content=mention_text, embed=embed)
@@ -172,15 +210,16 @@ async def on_thread_create(thread: discord.Thread):
     if parent_id is None:
         return
 
-    # Alle passenden Target-Channels für dieses Forum finden
-    targets = []
+    # New-thread-Targets für dieses Forum
+    new_targets: List[discord.TextChannel] = []
     for pair in gcfg.get("forum_pairs", []):
         if pair.get("forum_id") == parent_id:
-            t = guild.get_channel(pair.get("target_id", 0))
-            if isinstance(t, discord.TextChannel):
-                targets.append(t)
+            t_id = pair.get("new_target_id") or pair.get("follow_target_id")
+            ch = guild.get_channel(t_id)
+            if isinstance(ch, discord.TextChannel):
+                new_targets.append(ch)
 
-    if not targets:
+    if not new_targets:
         return
 
     link = thread.jump_url
@@ -194,7 +233,7 @@ async def on_thread_create(thread: discord.Thread):
     if owner:
         embed.set_footer(text=f"Erstellt von {owner.display_name}")
 
-    for ch in targets:
+    for ch in new_targets:
         try:
             await ch.send(embed=embed)
         except Exception as e:
@@ -217,26 +256,27 @@ def is_guild_admin():
 
 @bot.command(name="helpbot")
 async def help_bot(ctx: commands.Context):
-    """Zeigt eine kleine Hilfe für den ForumLinkBot."""
+    """Zeigt eine Hilfe für den ForumLinkBot."""
     prefix = ctx.prefix
     desc = (
         f"**ForumLinkBot – Hilfe**\n\n"
         f"**Allgemein**\n"
         f"`{prefix}helpbot` – Zeigt diese Hilfe\n\n"
         f"**Forum / Zielchannel Paare** (Server-Admin):\n"
-        f"`{prefix}addpair #forum #ziel` – Fügt ein Forum→Ziel-Channel-Paar hinzu\n"
+        f"`{prefix}addpair #forum #neu-channel #follow-channel` – "
+        f"Forum mit zwei Zielchannels verknüpfen (neue Threads / Follow-Pings)\n"
         f"`{prefix}listpairs` – Listet alle Paare\n"
-        f"`{prefix}delpair <index>` – Löscht ein Paar aus der Liste (Index aus `listpairs`)\n\n"
+        f"`{prefix}delpair <index>` – Löscht ein Paar (Index aus `listpairs`)\n\n"
         f"**Follow – Rollen & Threads**\n"
-        f"`{prefix}setfollowroles @Rolle1 [@Rolle2 …]` – Rollen, die angeschrieben werden sollen\n"
+        f"`{prefix}setfollowroles @Rolle1 [@Rolle2 …]` – Rollen, die bei Antworten gepingt werden\n"
         f"`{prefix}showfollowroles` – Zeigt aktuelle Follow-Rollen\n"
         f"`{prefix}clearfollowroles` – Entfernt alle Follow-Rollen\n\n"
         f"`{prefix}follow` – (im Thread) Diesen Thread beobachten\n"
-        f"`{prefix}unfollow` – (im Thread) Beobachtung beenden\n"
-        f"`{prefix}showfollow` – (im Thread) Zeigt, ob der Thread beobachtet wird\n\n"
-        f"**Hinweis:**\n"
-        f"- Benachrichtigungen werden **nicht** ausgelöst, wenn jemand mit einer Follow-Rolle (z.B. Mod/Admin) antwortet.\n"
-        f"- Follow funktioniert nur in Threads aus Foren, die mit `{prefix}addpair` verknüpft wurden."
+        f"`{prefix}unfollow` – Beobachtung beenden\n"
+        f"`{prefix}showfollow` – Zeigt, ob der Thread beobachtet wird\n\n"
+        f"**Hinweise**\n"
+        f"- Follow funktioniert nur in Threads von Foren, die mit `{prefix}addpair` verknüpft wurden.\n"
+        f"- Antworten von Nutzern mit Follow-Rolle lösen **keine** Benachrichtigung aus."
     )
     embed = discord.Embed(description=desc, color=0x7289DA)
     await ctx.send(embed=embed)
@@ -248,14 +288,28 @@ async def help_bot(ctx: commands.Context):
 @is_guild_admin()
 async def add_pair(ctx: commands.Context,
                    forum_channel: discord.ForumChannel,
-                   target_channel: discord.TextChannel):
-    """Fügt ein Forum→Ziel-Channel-Paar hinzu."""
+                   new_thread_channel: discord.TextChannel,
+                   follow_channel: discord.TextChannel):
+    """
+    Verknüpft ein Forum mit zwei Zielchannels:
+    - new_thread_channel: Meldung bei neuen Threads
+    - follow_channel: Follow-Benachrichtigungen bei Antworten
+    """
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["forum_pairs"].append(
-        {"forum_id": forum_channel.id, "target_id": target_channel.id}
+        {
+            "forum_id": forum_channel.id,
+            "new_target_id": new_thread_channel.id,
+            "follow_target_id": follow_channel.id,
+        }
     )
     save_config()
-    await ctx.send(f"✅ Paar hinzugefügt: Forum {forum_channel.mention} → {target_channel.mention}")
+    await ctx.send(
+        "✅ Paar hinzugefügt:\n"
+        f"Forum: {forum_channel.mention}\n"
+        f"Neue Threads → {new_thread_channel.mention}\n"
+        f"Follow-Pings → {follow_channel.mention}"
+    )
 
 
 @bot.command(name="listpairs")
@@ -264,16 +318,18 @@ async def list_pairs(ctx: commands.Context):
     gcfg = get_guild_cfg(ctx.guild.id)
     pairs = gcfg.get("forum_pairs", [])
     if not pairs:
-        await ctx.send("ℹ️ Es sind noch keine Forum→Ziel-Channel-Paare konfiguriert.")
+        await ctx.send("ℹ️ Es sind noch keine Forum-Paare konfiguriert.")
         return
 
     lines = []
     for idx, pair in enumerate(pairs, start=1):
         forum = ctx.guild.get_channel(pair.get("forum_id", 0))
-        target = ctx.guild.get_channel(pair.get("target_id", 0))
+        new_ch = ctx.guild.get_channel(pair.get("new_target_id", 0))
+        follow_ch = ctx.guild.get_channel(pair.get("follow_target_id", 0))
         lines.append(
-            f"**{idx}.** Forum: {forum.mention if forum else pair.get('forum_id')} "
-            f"→ Ziel: {target.mention if target else pair.get('target_id')}"
+            f"**{idx}.** Forum: {forum.mention if forum else pair.get('forum_id')}\n"
+            f"   Neue Threads → {new_ch.mention if new_ch else pair.get('new_target_id')}\n"
+            f"   Follow-Pings → {follow_ch.mention if follow_ch else pair.get('follow_target_id')}"
         )
 
     await ctx.send("\n".join(lines))
@@ -282,7 +338,7 @@ async def list_pairs(ctx: commands.Context):
 @bot.command(name="delpair")
 @is_guild_admin()
 async def delete_pair(ctx: commands.Context, index: int):
-    """Löscht ein Forum→Ziel-Paar anhand des Index aus `listpairs`."""
+    """Löscht ein Forum-Paar anhand des Index aus `listpairs`."""
     gcfg = get_guild_cfg(ctx.guild.id)
     pairs = gcfg.get("forum_pairs", [])
 
@@ -294,8 +350,10 @@ async def delete_pair(ctx: commands.Context, index: int):
     save_config()
 
     await ctx.send(
-        f"✅ Paar gelöscht (Forum-ID: `{removed.get('forum_id')}`, "
-        f"Target-ID: `{removed.get('target_id')}`)."
+        "✅ Paar gelöscht:\n"
+        f"Forum-ID: `{removed.get('forum_id')}`\n"
+        f"Neue Threads → `{removed.get('new_target_id')}`\n"
+        f"Follow-Pings → `{removed.get('follow_target_id')}`"
     )
 
 
@@ -369,7 +427,6 @@ async def follow_thread(ctx: commands.Context):
 
     gcfg = get_guild_cfg(ctx.guild.id)
 
-    # Prüfen, ob Thread zu einem bekannten Forum gehört
     parent_id = thread.parent_id
     if parent_id is None:
         await ctx.send("❌ Dieser Thread hat kein Forum als Elternkanal.")
@@ -391,8 +448,9 @@ async def follow_thread(ctx: commands.Context):
     save_config()
 
     await ctx.send(
-        f"✅ Dieser Thread wird nun beobachtet.\n"
-        f"Wenn jemand **ohne Follow-Rolle** antwortet, werden die Follow-Rollen benachrichtigt."
+        "✅ Dieser Thread wird nun beobachtet.\n"
+        "Wenn jemand **ohne Follow-Rolle** antwortet, werden die Follow-Rollen "
+        "im Follow-Channel dieses Forums benachrichtigt."
     )
 
 
